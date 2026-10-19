@@ -7,28 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 
 `ReplayComposition` composes placement and optional scaling into
 `Replayer<C>` without importing a serving framework into AISimulate core.
-The built-in `RoundRobinComposition` has fixed workers. The unpublished
-`aisimulate-python` wheel host adds `NativeDynamoReplayComposition`, calling
-Dynamo's native policy crates pinned to revision
-`f24c59b936ba23c933cc35d2f8c7f9ff71f54c3d`. The published core has no Dynamo
-dependency.
-Dynamo integrations may supply Planner callbacks through the same contracts.
+The built-in `RoundRobinComposition` has fixed workers. Dynamo constructs its
+own Router/Planner policies against the same neutral contracts.
 These are Rust crate interfaces, not a stable dynamically loaded binary ABI.
-
-## Standalone native routing
-
-A serialized ReplaySpec selects `adapters.placement.provider: dynamo_kv_router`
-with `config.affinity` and optional `config.router_config`. The native composition
-forwards requests to Dynamo's `LocalScheduler` and `SessionAffinity`. Dynamo
-owns queueing, capacity checks, selection, booking and affinity waits. AISimulate
-forwards dispatch and completion events and drives a paused Tokio clock using
-simulation timestamps; the shared Replayer owns the simulation. Python code is not invoked for
-each routing decision. `routing_policy` reports native provider provenance and
-per-pool evidence. Unsupported config combinations are errors.
-
-Dynamo's compatibility runner may use `execute_native_router_replay` with optional
-scaling/telemetry and prefill-estimator callbacks. Those hooks are not required
-by the built-in AISimulate runner. Conversation affinity uses static worker pools.
 
 ## Composition construction
 
@@ -109,8 +90,8 @@ Replay's responsibility during worker drain and removal.
 ## Observations and telemetry
 
 Compositions consume neutral engine observations only when needed. Round-robin
-can skip KV event capture; the native routing composition converts observations
-for Dynamo's KV index only when routing requires them. Offline P/D decode routing is overlap-blind and does not require
+can skip KV event capture; Dynamo performs Router-specific conversion outside
+AISimulate core. Offline P/D decode routing is overlap-blind and does not require
 its own KV event stream. A requested deterministic selector uses
 `ReplayDeterminism::selector_seed`, not an independently chosen seed.
 

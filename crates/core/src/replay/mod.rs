@@ -6,8 +6,8 @@
 //! [`Replayer`] owns virtual time, the event queue, logical-worker lifecycle,
 //! placement/scaling policy composition, and report collection. Engine
 //! scheduling and timing are supplied by [`crate::engine`] through its
-//! generalized-engine contract. Optional native routing links only Dynamo's
-//! production policy primitives; AISimulate owns its adapter and execution loop.
+//! generalized-engine contract. Downstream integrations supply routing adapters
+//! through neutral contracts; AISimulate owns the execution loop.
 
 mod agg;
 mod artifact;

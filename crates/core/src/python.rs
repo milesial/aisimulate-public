@@ -426,7 +426,7 @@ impl AicTimingConfig {
                     speculation.kind
                 ),
             }
-            return Ok(crate::py::speculation_replay_depth(speculation)?);
+            return Ok(speculation.replay_depth()?);
         }
         Ok(self.nextn)
     }
@@ -2930,12 +2930,6 @@ fn engine_launch_from_replay_role_json(
 }
 
 /// AISimulate native runtime module.
-#[pyfunction]
-fn native_router_available() -> bool {
-    false
-}
-
-/// AISimulate native runtime module.
 #[cfg(feature = "extension-module")]
 #[pymodule]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2945,7 +2939,6 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Register the core Python API in a host-owned extension module.
 /// A host may replace the replay entrypoints to supply its own composition.
 pub fn register_python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(native_router_available, module)?)?;
     module.add_function(wrap_pyfunction!(
         engine_launch_from_replay_role_json,
         module
