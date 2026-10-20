@@ -13,43 +13,50 @@ for a 3,600-second simulated admission window. The simulator runs offline on you
 CPU; you do not need to allocate those GPUs or download model weights.
 
 AISimulate owns workload preparation, the simulation loop, virtual time, and
-reports. With `--stack dynamo`, the installed Dynamo integration supplies its
-Router and conversation-affinity composition to AISimulate's shared executor.
-No Dynamo serving process or GPU deployment is required. The AISimulate wheel
-and Rust core contain no Dynamo Router implementation or dependency.
+reports. The default `engine` stack calls the separately installed Dynamo
+`OfflineRouter` policy API for placement and conversation affinity. Dynamo owns
+worker selection, KV indexing and affinity; AISimulate owns every simulation
+step and its acceptance tests. No Dynamo serving process or GPU deployment is
+required. The AISimulate wheel and Rust core contain no Dynamo Router
+implementation or build dependency.
 
 `traffic.load.agentic_profile.duration_seconds: 3600` controls simulated
 admission time, not CPU wall time. Functional simulation does not establish
 hardware performance accuracy.
 
-## 1. Install matching AISimulate and Dynamo development builds
+## 1. Install AISimulate and the standalone Dynamo policy API
 
-This path requires [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
-and [Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240).
-Dynamo's existing `ai-dynamo` package supplies the `dynamo` runner and
-`dynamo.router` configuration adapter; its matching native runtime supplies the
-routing implementation. Build both from matching source: the Dynamo PR pins
-the AISimulate revision used by its Rust dependency and container wheel build.
-Do not mix an older installed runtime with current Python source.
+This development path requires [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
+and [Dynamo #16854](https://github.com/ai-dynamo/dynamo/pull/16854), which exposes
+the standalone `dynamo._core.OfflineRouter` API in the runtime wheel. It does not require the `ai-dynamo` runner package or
+[Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240). The policy API
+must be provided in Dynamo first; AISimulate then consumes and accepts that API.
+Updating Dynamo's separate simulation integration to a newer AISimulate is an
+optional downstream follow-up.
 
 Follow [AISimulate source installation](../../getting-started/installation.md#use-current-source)
-and Dynamo's source-build instructions for these PR revisions. No new policy
-wheel or Dynamo release backport is required. For the commands below, install
-the matching builds into `/tmp/agentx-quickstart/venv` and record their source
-revisions and wheel hashes. Confirm plugin discovery before running:
+and Dynamo's source-build instructions at policy API revision
+[`2c4be58bdd6a2dc78c409bdfd67ad54d1b6fedf8`](https://github.com/ai-dynamo/dynamo/commit/2c4be58bdd6a2dc78c409bdfd67ad54d1b6fedf8). This guide
+does not claim that an existing released runtime exposes that API. Record both
+source revisions and wheel hashes. No Dynamo release backport is required.
+Install the builds into `/tmp/agentx-quickstart/venv` and check their interfaces:
 
 ```bash
 /tmp/agentx-quickstart/venv/bin/python - <<'PYTHON'
-from aisimulate.stack import resolve_runner_factory
+from aisimulate import _runtime
 from aisimulate.config_adapter import resolve_config_adapters
-print(resolve_runner_factory("dynamo").capabilities())
-print(resolve_config_adapters(["dynamo.router"])["dynamo.router"].name)
+from dynamo._core import OfflineRouter
+assert callable(_runtime.run_replay_with_policy_json)
+assert callable(OfflineRouter)
+print(resolve_config_adapters(["engine.router"])["engine.router"].name)
 PYTHON
 ```
 
-Dynamo #15631 and #16490 provide the policy's virtual-time and admission APIs.
-The integration links those APIs from its own Dynamo workspace; AISimulate
-does not fetch or compile a second pinned Dynamo source tree.
+Dynamo #15631 and #16490 provide virtual-time and admission APIs used by the
+standalone policy. Those implementations stay in Dynamo. AISimulate passes
+neutral lifecycle events to the policy; it does not fetch or compile a second
+Dynamo source tree. A missing policy API fails explicitly, without falling back
+to round-robin.
 
 ## 2. Download a reproducible Weka workload
 
@@ -158,9 +165,10 @@ native hard affinity and commits a binding only after the engine accepts dispatc
 The TTL starts when the last active request releases its lease, using simulated
 time; supported TTL values are 1 through 31,536,000 seconds, including fractions.
 
-Select `--stack dynamo` explicitly for this configuration. The default
-`engine` stack provides round-robin replay and rejects the uninstalled or
-wrong-stack router adapter; it never silently substitutes round-robin.
+Use the default `engine` stack, or select `--stack engine` explicitly. The
+built-in `engine.router` adapter translates configuration and policy messages;
+it does not implement Dynamo selection or affinity algorithms. Omitting the
+`router` block keeps ordinary round-robin replay independent of Dynamo.
 
 The trace's embedded hash blocks contain 64 tokens. The explicit
 `traffic.source.block_size: 64` keeps host resource inspection aligned with
@@ -202,7 +210,7 @@ transfer bandwidth is an example assumption, not a measured link speed.
 ## 4. Run the simulation
 
 ```bash
-/tmp/agentx-quickstart/venv/bin/aisimulate predict --stack dynamo \
+/tmp/agentx-quickstart/venv/bin/aisimulate predict --stack engine \
   --config /tmp/agentx-quickstart/agentx.yaml \
   --capture-per-request \
   --output-dir /tmp/agentx-quickstart/output \
@@ -216,7 +224,7 @@ To change the admission window to 600 simulated seconds without editing the
 YAML, use a CLI override:
 
 ```bash
-/tmp/agentx-quickstart/venv/bin/aisimulate predict --stack dynamo \
+/tmp/agentx-quickstart/venv/bin/aisimulate predict --stack engine \
   --config /tmp/agentx-quickstart/agentx.yaml \
   --set traffic.load.agentic_profile.duration_seconds=600 \
   --capture-per-request \
@@ -307,16 +315,40 @@ seeded snapshots for the initial lanes.
 
 ## Capability boundaries
 
-The Dynamo integration supports offline vLLM/SGLang aggregated and P/D simulation,
+AISimulate's engine stack with the Dynamo policy API supports offline
+vLLM/SGLang aggregated and P/D simulation,
 including attention DP, seeded snapshots, saved-frontier warmup and duration
 profiles. Conversation affinity uses a fixed routing configuration and requires
 static workers, device-only KV cache, default scoring, and speculative decoding
 disabled. Planner scaling, custom prefill estimators or policy classes, authored
 DP pins, online execution and unsupported backends are rejected with affinity.
-Canonical selector seeds require a separate `replay-bench` build. Workload/snapshot seeds remain supported. The Dynamo
-package and runtime must match the AISimulate core used to build them.
+Canonical selector seeds require a separate `replay-bench` build.
+Workload/snapshot seeds remain supported. AISimulate and the standalone Dynamo
+policy communicate through a versioned data protocol; the Dynamo policy does
+not depend on the AISimulate core crate.
 
 The KV index receives physical simulated engine store/remove events. Cache reuse
 is still simulated behavior, not measured GPU performance. The existing
 saved-frontier warmup and snapshot sampling differ from the live AgentX harness;
 this guide does not claim full recipe or bitwise parity.
+
+## Acceptance from AISimulate
+
+The CPU-only acceptance suite lives in this repository. Run it with an
+AISimulate wheel built from this revision and the Dynamo runtime exposing
+`OfflineRouter`, without installing the `ai-dynamo` integration package:
+
+```bash
+AISIM_REQUIRE_DYNAMO_ROUTER=1 /tmp/agentx-quickstart/venv/bin/python -m pytest \
+  tests/test_conversation_routing_cli.py
+```
+
+The required mode fails when the policy API is absent. Ordinary unit environments
+may skip this optional dependency. The suite invokes the AISimulate CLI with its
+default engine stack and blocks Dynamo replay/runner imports in both the
+coordinator and supervised workers. It covers vLLM/SGLang, aggregated/P-D,
+session/sibling affinity, physical cache reuse with disabled-cache controls,
+destination-cache transfer savings, Weka parent/child lineage, worker tokenization,
+and snapshot/warmup
+with a continuous AgentX profile. These are functional acceptance checks, not
+hardware accuracy qualification.

@@ -35,6 +35,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyModule};
 use serde::Deserialize;
 
+mod external_policy;
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ExecutionPayload {
@@ -2872,6 +2874,18 @@ fn run_replay_json(py: Python<'_>, payload: &str) -> PyResult<String> {
         .map_err(replay_python_error)
 }
 
+/// Execute with an independently installed placement policy while retaining
+/// AISimulate's workload, engine, virtual clock and report ownership.
+#[pyfunction]
+fn run_replay_with_policy_json(
+    py: Python<'_>,
+    payload: &str,
+    factory: Py<PyAny>,
+) -> PyResult<String> {
+    py.allow_threads(|| external_policy::execute(payload, factory))
+        .map_err(replay_python_error)
+}
+
 /// Execute one fixed aggregated ReplaySpec and return report plus parity artifacts.
 #[pyfunction]
 fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<String> {
@@ -2945,6 +2959,7 @@ pub fn register_python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
+    module.add_function(wrap_pyfunction!(run_replay_with_policy_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     crate::perfmodel::register_python(module)?;
     Ok(())

@@ -11,6 +11,34 @@ The built-in `RoundRobinComposition` has fixed workers. Dynamo constructs its
 own Router/Planner policies against the same neutral contracts.
 These are Rust crate interfaces, not a stable dynamically loaded binary ABI.
 
+## External policy transport
+
+The engine stack can call an independently built policy through
+`aisimulate._runtime.run_replay_with_policy_json(payload_json, factory)` while
+retaining AISimulate's executor. The factory receives JSON describing one
+role, worker topology, resolved engine configuration, placement descriptor,
+selector seed and capture settings. It returns an object implementing
+`call_json(command_json) -> result_json`.
+
+Commands carry schema-versioned neutral data for placement, KV observations,
+dispatch commit/abort, terminal requests, virtual-time advancement, cancellation,
+and worker lifecycle events. A result supplies the operation result, pending
+count and next wakeup. A final snapshot adds provider-owned evidence without
+copying a growing decision log on every callback. Policy errors fail simulation;
+they cannot silently select another policy. Evidence is returned by role in
+`external_policy` and may be presented by the Python adapter as `routing_policy`.
+
+Dynamo's standalone `OfflineRouter` implements the policy side without depending
+on AISimulate. The built-in `engine.router` adapter only translates configuration
+and transport fields. The `ai-dynamo` whole-run plugin and its AISimulate version
+update are optional for this path. The AISimulate CLI and its acceptance suite
+exercise the complete AgentX simulation. See the
+[AgentX quickstart](../replay/agentic/quickstart.md).
+
+This Python/JSON boundary does not link Dynamo into the AISimulate wheel. The
+Rust composition interface below remains available to consumers that choose to
+compile against AISimulate's core.
+
 ## Composition construction
 
 The trait is defined in

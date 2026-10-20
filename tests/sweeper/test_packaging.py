@@ -99,13 +99,14 @@ def test_aisimulate_has_no_dynamo_or_component_adapter_dependencies():
     assert "prophet" not in names
 
 
-def test_importing_sweeper_does_not_import_dynamo():
+@pytest.mark.parametrize("module", ["aisimulate.sweeper", "aisimulate.router"])
+def test_importing_simulation_adapters_does_not_import_dynamo(module):
     subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sys; import aisimulate.sweeper; "
+                f"import sys; import {module}; "
                 "assert not any(name == 'dynamo' or name.startswith('dynamo.') "
                 "for name in sys.modules)"
             ),
@@ -144,7 +145,7 @@ def test_aisimulate_source_versions_are_synchronized():
     assert project["tool"]["maturin"]["manifest-path"] == "../../crates/core/Cargo.toml"
     lock = tomllib.loads((repo_root / "Cargo.lock").read_text())
     assert not any(package["name"].startswith("dynamo-") for package in lock["package"])
-    assert not (root / "src/aisimulate/router.py").exists()
+    assert not (repo_root / "crates/python").exists()
 
 
 def test_profiler_does_not_publish_or_reexport_sweeper():

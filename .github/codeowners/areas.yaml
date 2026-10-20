@@ -295,6 +295,8 @@ shared:
     owners: [forward-pass-engine, maintainers]
   - glob: crates/core/src/python.rs
     owners: [mocker, replay, forward-pass-engine, maintainers]
+  - glob: crates/core/src/python/**
+    owners: [mocker, replay, forward-pass-engine, maintainers]
   - glob: Cargo.lock
     owners: [infra, maintainers]
   - glob: Cargo.toml
