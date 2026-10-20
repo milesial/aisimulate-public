@@ -14,10 +14,10 @@ use crate::engine::{
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
     POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
-    ReplayCaptureOptions, ReplayComposition, ReplayDeterminism, ReplayEngineConfig,
-    ReplayEngineFactory, ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics,
-    ReplayPowerDiagnostics, ReplayReport, ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec,
-    ReplayTelemetryObserver, ReplayTopology, Replayer, TracePowerStats,
+    ReplayCaptureOptions, ReplayDeterminism, ReplayEngineConfig, ReplayEngineFactory,
+    ReplayOperationPowerDiagnostics, ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics,
+    ReplayReport, ReplayRoleConfig, ReplayRuntimeInput, ReplaySpec, ReplayTopology, Replayer,
+    TracePowerStats,
     loadgen::{
         AgenticProfileOptions, AgenticSnapshotOptions, ArrivalSpec, DelaySpec, DynamoRequestTrace,
         LengthSpec, SyntheticTraceSpec, Trace, ValidatedAgenticGraph, WekaImportOptions,
@@ -57,13 +57,13 @@ enum ExecutionPayload {
 /// Per-worker tokenization applied between placement and the engine.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TokenizationPayload {
+struct TokenizationPayload {
     #[serde(default = "default_tokenization_workers")]
-    pub workers: usize,
+    workers: usize,
     #[serde(default)]
-    pub base_ms: f64,
+    base_ms: f64,
     #[serde(default)]
-    pub per_input_token_ms: f64,
+    per_input_token_ms: f64,
 }
 
 fn default_tokenization_workers() -> usize {
@@ -1817,9 +1817,7 @@ fn build_runtime_input(
     ))
 }
 
-/// Execute prepared replay inputs using the built-in placement and artifact path.
-/// Hosts selecting a custom composition can delegate their default branch here.
-pub fn run_prepared_replay(
+fn run_with_input(
     spec: ReplaySpec,
     factory: ReplayEngineFactory,
     input: Option<ReplayRuntimeInput>,
@@ -2321,26 +2319,24 @@ fn replay_fpm_coverage(
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
-    execute_replay_with_dispatch(payload, capture_artifacts, run_prepared_replay)?.into_json()
+    execute_replay_with_dispatch(payload, capture_artifacts, run_with_input)?.into_json()
 }
 
-/// Complete execution result before the compact JSON boundary.
+/// Shared report serialization for built-in and external placement policies.
 #[derive(Debug)]
-pub struct ReplayExecutionResult {
+struct ReplayExecutionResult {
     /// Includes per-request records and execution-owned runtime evidence.
-    pub report: ReplayReport,
+    report: ReplayReport,
     /// Single-worker parity artifacts, when requested through the built-in runtime.
-    pub artifacts: Option<ReplayArtifacts>,
+    artifacts: Option<ReplayArtifacts>,
     /// Additional execution diagnostics and input provenance that are not
     /// part of the topology runtime's typed report.
-    pub report_fields: serde_json::Map<String, serde_json::Value>,
+    report_fields: serde_json::Map<String, serde_json::Value>,
     include_per_request: bool,
 }
 
 impl ReplayExecutionResult {
-    /// Serialize the existing report/artifacts JSON contract without discarding
-    /// typed evidence before a native consumer has had a chance to inspect it.
-    pub fn into_json(self) -> Result<String> {
+    fn into_json(self) -> Result<String> {
         let mut report_json = serde_json::to_value(&self.report)
             .context("serializing AISimulate replay report summary")?;
         let object = report_json
@@ -2364,75 +2360,10 @@ impl ReplayExecutionResult {
     }
 }
 
-/// Resolve a serialized execution payload and run a caller-owned composition.
-///
-/// This shares timing/capacity construction, workload preparation, capture,
-/// telemetry and finalization with the built-in runtime. Native consumers retain
-/// the full typed report, including lifecycle evidence omitted from compact JSON.
-pub fn execute_replay_with_composition<C: ReplayComposition>(
-    payload: &str,
-    composition: C,
-    capture: ReplayCaptureOptions,
-    telemetry: Option<(f64, Box<dyn ReplayTelemetryObserver>)>,
-) -> Result<ReplayExecutionResult> {
-    let mut result = execute_replay_with_dispatch(
-        payload,
-        false,
-        move |mut spec, factory, input, _, determinism, tokenization| {
-            let mut capture = capture;
-            // Canonical replay may be selected at either public input boundary.
-            // Keep an explicit native capture choice when the payload uses defaults.
-            if determinism == ReplayDeterminism::CanonicalV1 {
-                capture.determinism = determinism;
-            }
-            spec.record_per_request |= capture.effective_per_request();
-            let mut replayer = Replayer::with_composition(spec, factory, composition)?
-                .with_capture_options(capture);
-            if let Some(input) = input {
-                replayer = replayer.with_runtime_input(input);
-            }
-            if let Some(tokenization) = tokenization {
-                replayer = replayer.with_tokenization(
-                    tokenization.workers,
-                    tokenization.base_ms,
-                    tokenization.per_input_token_ms,
-                )?;
-            }
-            if let Some((interval_ms, observer)) = telemetry {
-                replayer = replayer.with_telemetry_observer(interval_ms, observer)?;
-            }
-            replayer.run().map(|report| (report, None))
-        },
-    )?;
-    result.include_per_request |= capture.effective_per_request();
-    Ok(result)
-}
-
-/// Run the canonical serialized execution payload with a caller-owned policy.
-///
-/// Optional native adapters use this string-only boundary to retain the same
-/// timing/capacity construction, workload driver, preparation and report
-/// finalization as the built-in Python runtime. No Python engine handles cross
-/// extension-module boundaries. Detailed parity artifacts remain the built-in
-/// single-worker interface; adapters observe native events through their
-/// [`ReplayComposition`] instead.
-pub fn execute_replay_json_with_composition<C: ReplayComposition>(
-    payload: &str,
-    capture_artifacts: bool,
-    composition: C,
-) -> Result<String> {
-    ensure!(
-        !capture_artifacts,
-        "custom replay compositions do not expose single-worker parity artifacts"
-    );
-    execute_replay_with_composition(payload, composition, ReplayCaptureOptions::default(), None)?
-        .into_json()
-}
-
 /// Resolve and finalize a replay while the host selects its execution composition.
 /// The callback receives the same prepared inputs as the built-in executor,
 /// after canonical parsing, timing construction, and workload preparation.
-pub fn execute_replay_with_dispatch<F>(
+fn execute_replay_with_dispatch<F>(
     payload: &str,
     capture_artifacts: bool,
     run: F,
@@ -2845,8 +2776,7 @@ impl serde::Serialize for RecordValues<'_> {
     }
 }
 
-/// Preserve resource exhaustion and error context across Python replay bindings.
-pub fn replay_python_error(error: anyhow::Error) -> PyErr {
+fn replay_python_error(error: anyhow::Error) -> PyErr {
     let exception = if error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<crate::replay::ReplayError>(),
@@ -2944,15 +2874,8 @@ fn engine_launch_from_replay_role_json(
 }
 
 /// AISimulate native runtime module.
-#[cfg(feature = "extension-module")]
 #[pymodule]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    register_python_module(module)
-}
-
-/// Register the core Python API in a host-owned extension module.
-/// A host may replace the replay entrypoints to supply its own composition.
-pub fn register_python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(
         engine_launch_from_replay_role_json,
         module
@@ -5287,96 +5210,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_bindings_preserve_payload_and_native_capture_determinism() {
-        for topology in [
-            ReplayTopology::aggregated(1),
-            ReplayTopology::Disaggregated {
-                prefill: WorkerPoolSpec::default(),
-                decode: WorkerPoolSpec::default(),
-                handoff_latency_ms: 0.0,
-            },
-        ] {
-            let engine = ReplayEngineConfig {
-                rank: EngineConfig {
-                    num_gpu_blocks: 16,
-                    block_size: 4,
-                    timing_model: TimingModelConfig::Fixed {
-                        prefill_ms: 1.0,
-                        decode_ms: 1.0,
-                    },
-                    ..EngineConfig::default()
-                },
-                ..ReplayEngineConfig::default()
-            };
-            for payload_determinism in [ReplayDeterminism::Random, ReplayDeterminism::CanonicalV1] {
-                let payload = serde_json::json!({
-                    "spec": {
-                        "topology": topology,
-                        "engine": engine,
-                        "requests": [{
-                            "id": "authored-id", "arrival_time_ms": 0.0,
-                            "input_tokens": 4, "output_tokens": 1,
-                        }],
-                    },
-                    "determinism": payload_determinism,
-                })
-                .to_string();
-                let canonical_uuid = uuid::Uuid::from_u128(1).to_string();
-                let canonical_payload = payload_determinism == ReplayDeterminism::CanonicalV1;
-                for capture_artifacts in [false, true] {
-                    if capture_artifacts && matches!(topology, ReplayTopology::Disaggregated { .. })
-                    {
-                        continue;
-                    }
-                    let output: serde_json::Value =
-                        serde_json::from_str(&execute_json(&payload, capture_artifacts).unwrap())
-                            .unwrap();
-                    let report = if capture_artifacts {
-                        &output["report"]
-                    } else {
-                        &output
-                    };
-                    assert_eq!(
-                        report["per_request"][0]["uuid"] == canonical_uuid,
-                        canonical_payload
-                    );
-                }
-                let composed: serde_json::Value = serde_json::from_str(
-                    &execute_replay_json_with_composition(
-                        &payload,
-                        false,
-                        crate::replay::RoundRobinComposition,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(
-                    composed["per_request"][0]["uuid"] == canonical_uuid,
-                    canonical_payload
-                );
-                for native_determinism in
-                    [ReplayDeterminism::Random, ReplayDeterminism::CanonicalV1]
-                {
-                    let typed = execute_replay_with_composition(
-                        &payload,
-                        crate::replay::RoundRobinComposition,
-                        ReplayCaptureOptions {
-                            determinism: native_determinism,
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        typed.report.per_request[0].uuid == canonical_uuid,
-                        canonical_payload || native_determinism == ReplayDeterminism::CanonicalV1,
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn json_bindings_share_report_and_retain_request_correlation() {
         let mut spec = ReplaySpec {
             version: 1,
@@ -5424,67 +5257,6 @@ mod tests {
         let payload = serde_json::to_string(&spec).unwrap();
         let output = execute_json(&payload, false).unwrap();
         let report: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let composed: serde_json::Value = serde_json::from_str(
-            &execute_replay_json_with_composition(
-                &payload,
-                false,
-                crate::replay::RoundRobinComposition,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        for field in [
-            "completed_requests",
-            "total_input_tokens",
-            "total_output_tokens",
-            "power_diagnostics",
-            "agentic_play_outcomes",
-        ] {
-            assert_eq!(
-                composed[field], report[field],
-                "shared report field {field}"
-            );
-        }
-        assert_eq!(composed["per_request"][0]["request_id"], "authored-id");
-        let mut typed_payload = serde_json::json!({
-            "spec": spec,
-            "capture_performance_diagnostics": true,
-        });
-        typed_payload["spec"]["record_per_request"] = false.into();
-        let typed = execute_replay_with_composition(
-            &typed_payload.to_string(),
-            crate::replay::RoundRobinComposition,
-            ReplayCaptureOptions {
-                capture_canonical_evidence: true,
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
-        assert_eq!(typed.report.request_counts.completed_requests, 1);
-        assert_eq!(typed.report.per_request.len(), 1);
-        assert!(typed.report.runtime_evidence.pressure.is_some());
-        assert!(typed.report.power_diagnostics.is_some());
-        assert!(typed.report_fields["performance_diagnostics"].is_object());
-        assert_eq!(
-            typed.report_fields["prediction_provenance"],
-            report["prediction_provenance"]
-        );
-        assert!(typed.artifacts.is_none());
-        let serialized: serde_json::Value =
-            serde_json::from_str(&typed.into_json().unwrap()).unwrap();
-        assert_eq!(serialized["per_request"][0]["request_id"], "authored-id");
-        assert!(serialized["performance_diagnostics"].is_object());
-        assert!(
-            execute_replay_json_with_composition(
-                &payload,
-                true,
-                crate::replay::RoundRobinComposition,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("parity artifacts")
-        );
         let record = &report["per_request"][0];
         assert_eq!(record["request_id"], "authored-id");
         assert_eq!(record["session_id"], "session-a");
@@ -5529,19 +5301,6 @@ mod tests {
         for record_per_request in [false, true] {
             spec.record_per_request = record_per_request;
             let payload = serde_json::to_string(&spec).unwrap();
-            let typed = execute_replay_with_composition(
-                &payload,
-                crate::replay::RoundRobinComposition,
-                ReplayCaptureOptions {
-                    capture_per_request: true,
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
-            let output: serde_json::Value =
-                serde_json::from_str(&typed.into_json().unwrap()).unwrap();
-            assert_eq!(output["per_request"], serde_json::json!([]));
             for capture_artifacts in [false, true] {
                 let output: serde_json::Value =
                     serde_json::from_str(&execute_json(&payload, capture_artifacts).unwrap())

@@ -159,9 +159,7 @@ pub use protocol::{
 };
 #[doc(hidden)]
 pub use replayer::ReplayRuntimeInput;
-pub use replayer::{
-    ReplayComposition, Replayer, RoundRobinComposition, run_replay_with_composition,
-};
+pub use replayer::{ReplayComposition, Replayer, RoundRobinComposition};
 #[doc(hidden)]
 pub use report::TraceCollector;
 pub use report::{

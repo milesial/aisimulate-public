@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
@@ -186,60 +187,281 @@ def _require_affinity_scope(spec: ReplaySpec) -> None:
             raise ValueError("router.affinity requires static worker pools without startup delay")
 
 
-def run_dynamo_policy(runtime: Any, payload: str) -> str:
-    """Run AISimulate's executor with an optional, externally installed policy."""
-    import json
+class _DynamoPolicy:
+    """Translate AISim lifecycle events into existing Dynamo policy operations."""
 
-    if not callable(getattr(runtime, "run_replay_with_policy_json", None)):
-        raise ValueError("AISimulate runtime lacks the external policy API; rebuild the matching AISimulate wheel")
+    def __init__(self, context_json: str):
+        from dynamo import _core as native
 
-    try:
-        from dynamo._core import OfflineRouter
-    except ImportError as error:
-        raise ValueError(
-            "router.policy=kv_router requires ai-dynamo-runtime with the OfflineRouter API; "
-            "install the matching Dynamo policy build. The ai-dynamo replay plugin is not required."
-        ) from error
-
-    def create_policy(context_json: str) -> Any:
         context = json.loads(context_json)
         if context["schema_version"] != 1:
             raise ValueError("unsupported external placement protocol version")
-        dp_size = context["dp_size"]
-        topology = context["topology"]
-        for worker_id, worker in enumerate(topology):
+        self.role = context["role"]
+        self.dp_size = context["dp_size"]
+        self.workers = set(range(len(context["topology"])))
+        for worker_id, worker in enumerate(context["topology"]):
             if worker != {
                 "worker_id": worker_id,
-                "scheduler_ids": list(range(worker_id * dp_size, (worker_id + 1) * dp_size)),
+                "scheduler_ids": list(range(worker_id * self.dp_size, (worker_id + 1) * self.dp_size)),
             }:
                 raise ValueError("Dynamo policy requires contiguous worker and rank IDs")
         rank = context["engine"]["rank"]
+        self.block_size = rank["block_size"]
         config = context["placement"]["config"]
-        return OfflineRouter(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "role": context["role"],
-                    "dp_size": dp_size,
-                    "num_workers": len(topology),
-                    "block_size": rank["block_size"],
-                    "num_gpu_blocks": rank["num_gpu_blocks"],
-                    "max_num_batched_tokens": rank["max_num_batched_tokens"],
-                    "router_config": config.get("router_config", {}),
-                    "affinity": config.get("affinity"),
-                    "capture_decisions": context["capture_decisions"],
-                    "selector_seed": context["selector_seed"],
-                }
+        router_config = dict(config.get("router_config", {}))
+        # Each pool reports its own load: prefill has no decode occupancy, and
+        # decode allocates independent blocks without prefill-cache credit.
+        if self.role == "prefill":
+            router_config["router_track_active_blocks"] = False
+        elif self.role == "decode":
+            router_config.update(
+                overlap_score_credit=0.0,
+                router_assume_kv_reuse=False,
+                router_track_prefill_tokens=False,
+                router_prefill_load_model="none",
             )
+        self.native = native
+        self.router = native.OfflineRouter(
+            self.block_size,
+            len(self.workers),
+            self.dp_size,
+            rank["num_gpu_blocks"],
+            rank["max_num_batched_tokens"],
+            json.dumps(router_config),
+            context["selector_seed"],
+        )
+        self.tree = native.RadixTree()
+        self.affinity_config = config.get("affinity")
+        self.affinity = native.SessionAffinity(self.affinity_config["ttl_seconds"]) if self.affinity_config else None
+        self.waiting = {}
+        self.pending = {}
+        self.staged = {}
+        self.active = {}
+        self.now_ms = 0.0
+        self.ready = False
+        self.evidence = dict(
+            native_policy="dynamo.DefaultWorkerSelector",
+            dynamo_version=native.__version__,
+            physical_kv_events=0,
+            decision_count=0,
+            decisions_captured=context["capture_decisions"],
+            decisions=[],
+            post_dispatch_checks=0,
+            dispatch_aborts=0,
         )
 
-    report = json.loads(runtime.run_replay_with_policy_json(payload, create_policy))
+    def _group(self, command):
+        if self.affinity is None:
+            return None
+        context = command["request"].get("replay_context") or {}
+        agentic = context.get("agentic") or {}
+        session = agentic.get("conversation_id") or command.get("session_id") or context.get("session_id")
+        if not session:
+            raise ValueError("conversation affinity requires nonempty session identity")
+        play = agentic.get("play_id")
+        identity = ["session", play, session]
+        if self.affinity_config["mode"] == "sibling_group":
+            lineage = agentic.get("lineage") or {}
+            if lineage.get("schema") != "aisimulate.agentic.conversation-lineage.v1" or not lineage.get(
+                "root_conversation_id"
+            ):
+                raise ValueError("sibling_group affinity requires unambiguous conversation lineage")
+            parent = lineage.get("parent_conversation_id")
+            identity = ["siblings" if parent else "root", play, lineage["root_conversation_id"], parent or session]
+        return self.native.subagent_group_affinity_id(json.dumps(identity))
+
+    def _submit(self, command):
+        request = command["request"]
+        request_id = request["uuid"]
+        group = self._group(command)
+        hold = self.affinity.try_acquire(group) if self.affinity else None
+        if self.affinity and hold is None:
+            self.waiting[request_id] = command
+            return
+        length = command["input_length"]
+        hashes = command.get("hashes")
+        tokens = request.get("tokens", [])
+        if hashes is None:
+            source = (request.get("replay_context") or {}).get("prompt_token_source")
+            if source not in (None, "materialized") or len(tokens) != length:
+                raise ValueError("Dynamo routing requires authored prompt tokens or complete block hashes")
+            local = self.native.compute_block_hash_for_seq(tokens, self.block_size)
+            sequence = None
+        else:
+            local, sequence = hashes["local_block_hashes"], hashes["sequence_hashes"]
+            if len(local) != length // self.block_size or len(sequence) != len(local):
+                raise ValueError("request hashes must cover exactly the complete prompt blocks")
+        limit = (
+            len(request["output_token_ids"])
+            if request.get("output_token_ids") is not None
+            else request["max_output_tokens"]
+        )
+        if command.get("max_output_tokens_override") is not None:
+            limit = min(limit, command["max_output_tokens_override"])
+        target = hold.target if hold else None
+        self.router.submit(
+            request_id,
+            length,
+            limit,
+            self.tree.find_matches(local),
+            local,
+            sequence,
+            tokens if len(tokens) == length else None,
+            target,
+            max(0, request.get("priority", 0)),
+            request.get("strict_priority", 0),
+            request.get("policy_class"),
+            command.get("session_id"),
+        )
+        self.pending[request_id] = (length, group, hold)
+
+    def _drain(self):
+        for request_id in list(self.waiting):
+            self._submit(self.waiting.pop(request_id))
+        result = []
+        for request_id, worker, rank, overlap, best in self.router.poll():
+            length, group, hold = self.pending.pop(request_id)
+            self.staged[request_id] = (hold, (worker, rank))
+            self.evidence["decision_count"] += 1
+            if self.evidence["decisions_captured"]:
+                self.evidence["decisions"].append(
+                    dict(
+                        request_id=request_id,
+                        role=self.role,
+                        native_policy=self.evidence["native_policy"],
+                        worker_id=worker,
+                        dp_rank=rank,
+                        group_key=group,
+                        binding_reused=hold is not None and hold.target is not None,
+                        overlap_blocks=overlap,
+                        best_available_overlap_blocks=best,
+                    )
+                )
+            result.append(
+                dict(
+                    request_id=request_id,
+                    scheduler_id=worker * self.dp_size + rank,
+                    reported_overlap_tokens=overlap * self.block_size,
+                    cache_sample=dict(
+                        overlap_blocks=overlap,
+                        best_available_overlap_blocks=best,
+                        isl_blocks=(length + self.block_size - 1) // self.block_size,
+                    ),
+                )
+            )
+        self.ready = False
+        return result
+
+    def _cancel(self, request_id):
+        removed = self.waiting.pop(request_id, None) is not None
+        pending = self.pending.pop(request_id, None)
+        if pending is not None:
+            self.router.cancel(request_id)
+            if pending[2] is not None:
+                pending[2].release()
+            removed = True
+        self.ready |= removed
+        return removed
+
+    def call_json(self, command_json: str) -> str:
+        command = json.loads(command_json)
+        op, request_id = command["op"], command.get("request_id")
+        if "now_ms" in command:
+            self.router.advance_clock(command["now_ms"])
+            if self.affinity:
+                self.affinity.advance_clock(command["now_ms"])
+            self.now_ms = command["now_ms"]
+        result = None
+        if op == "place":
+            request = command["request"]
+            request_id = request["uuid"]
+            if any(request_id in state for state in (self.waiting, self.pending, self.staged, self.active)):
+                raise ValueError("duplicate routing request")
+            if request.get("preferred_dp_rank") is not None or request.get("preferred_prefill_dp_rank") is not None:
+                raise ValueError("Dynamo policy does not support authored DP-rank pins")
+            self._submit(command)
+            ready = self._drain()
+            result = dict(
+                placement=next((row for row in ready if row["request_id"] == request_id), None),
+                released=[row for row in ready if row["request_id"] != request_id],
+            )
+        elif op == "dispatch_committed":
+            hold, target = self.staged.pop(request_id)
+            self.active[request_id] = self.affinity.commit(hold, *target) if hold else None
+            self.evidence["post_dispatch_checks"] += 1
+            self.ready = True
+        elif op in ("request_terminal", "dispatch_aborted"):
+            self._cancel(request_id)
+            hold, _ = self.staged.pop(request_id, (None, None))
+            lease = self.active.pop(request_id, None)
+            for owned in (hold, lease):
+                if owned is not None:
+                    owned.release()
+            self.router.free(request_id)
+            self.ready = True
+            if op == "dispatch_aborted":
+                self.evidence["dispatch_aborts"] += 1
+            else:
+                result = self._drain()
+        elif op == "cancel_pending":
+            result = self._cancel(request_id)
+        elif op == "prefill_completed":
+            self.router.prefill_complete(request_id)
+            result = self._drain()
+        elif op == "observe":
+            for batch in command["events"]:
+                if (
+                    batch["stage"] != self.role
+                    or batch["worker_id"] not in self.workers
+                    or not 0 <= batch["dp_rank"] < self.dp_size
+                ):
+                    raise ValueError("cache observation has an invalid role, worker or rank")
+                for event in batch["events"]:
+                    if event.get("tier", "device") != "device" or event["dp_rank"] != batch["dp_rank"]:
+                        raise ValueError("routing requires device KV events with matching rank")
+                    if self.role != "decode":
+                        self.tree.apply_event(batch["worker_id"], json.dumps(event).encode())
+                        self.evidence["physical_kv_events"] += 1
+            result = []
+        elif op in ("advance_clock", "topology_settled"):
+            result = self._drain()
+        elif op in ("worker_ready", "worker_draining", "worker_removed"):
+            worker = command["worker"]["worker_id"]
+            if op == "worker_ready":
+                self.router.add_worker(worker)
+                self.workers.add(worker)
+            elif op == "worker_draining":
+                self.router.remove_worker(worker)
+            else:
+                self.router.unregister_worker(worker)
+                self.tree.remove_worker(worker)
+                self.workers.remove(worker)
+            result = []
+        elif op not in ("status", "snapshot"):
+            raise ValueError(f"unknown policy operation {op!r}")
+        pending = len(self.waiting) + len(self.pending)
+        response = dict(
+            result=result, pending_count=pending, next_wakeup_ms=self.now_ms if self.ready and pending else None
+        )
+        if op == "snapshot":
+            response["evidence"] = self.evidence
+        return json.dumps(response, separators=(",", ":"))
+
+
+def run_dynamo_policy(runtime: Any, payload: str) -> str:
+    """Run AISimulate's executor using independently installed native policy APIs."""
+    try:
+        from dynamo._core import OfflineRouter, SessionAffinity
+    except ImportError as error:
+        raise ValueError(
+            "router.policy=kv_router requires ai-dynamo-runtime with OfflineRouter and SessionAffinity"
+        ) from error
+    if not hasattr(OfflineRouter, "submit") or not hasattr(SessionAffinity, "try_acquire"):
+        raise ValueError("installed Dynamo runtime predates the standalone policy bindings")
+    report = json.loads(runtime.run_replay_with_policy_json(payload, _DynamoPolicy))
     roles = report.pop("external_policy")
     first = next(iter(roles.values()))
-    report["routing_policy"] = {
-        "api_version": 1,
-        "native_policy": first["native_policy"],
-        "dynamo_version": first["dynamo_version"],
-        "roles": roles,
-    }
+    report["routing_policy"] = dict(
+        api_version=1, native_policy=first["native_policy"], dynamo_version=first["dynamo_version"], roles=roles
+    )
     return json.dumps(report, separators=(",", ":"))

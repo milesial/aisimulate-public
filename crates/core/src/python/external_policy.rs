@@ -14,13 +14,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::engine::{KvEvent, KvEventData, KvEventTier};
+use crate::engine::{KvEvent, KvEventData};
 use crate::replay::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use crate::replay::{
-    EngineEventBatch, KvIngestEventEncoder, Placement, PlacementCacheSample, PlacementDecision,
-    PlacementEffects, PlacementPolicy, ReplayAdmissionMetadata, ReplayCaptureOptions,
-    ReplayComposition, ReplayDeterminism, ReplayEngineConfig, ReplayEngineObservation, ReplayError,
-    ReplayResult, ReplaySpec, WorkerStage, WorkerTopology,
+    EngineEventBatch, Placement, PlacementDecision, PlacementEffects, PlacementPolicy,
+    ReplayAdmissionMetadata, ReplayCaptureOptions, ReplayComposition, ReplayDeterminism,
+    ReplayEngineConfig, ReplayEngineObservation, ReplayError, ReplayResult, ReplaySpec, Replayer,
+    WorkerStage, WorkerTopology,
 };
 
 /// Keep every owned reference's destruction on the synchronous replay thread.
@@ -82,11 +82,27 @@ pub(super) fn execute(payload: &str, factory: Py<PyAny>) -> Result<String> {
         determinism: ReplayDeterminism::default(),
         shared: shared.clone(),
     };
-    let mut output = super::execute_replay_with_composition(
+    let mut output = super::execute_replay_with_dispatch(
         payload,
-        composition,
-        ReplayCaptureOptions::default(),
-        None,
+        false,
+        move |spec, factory, input, _, determinism, tokenization| {
+            let mut replayer = Replayer::with_composition(spec, factory, composition)?
+                .with_capture_options(ReplayCaptureOptions {
+                    determinism,
+                    ..Default::default()
+                });
+            if let Some(input) = input {
+                replayer = replayer.with_runtime_input(input);
+            }
+            if let Some(tokenization) = tokenization {
+                replayer = replayer.with_tokenization(
+                    tokenization.workers,
+                    tokenization.base_ms,
+                    tokenization.per_input_token_ms,
+                )?;
+            }
+            replayer.run().map(|report| (report, None))
+        },
     )?;
     // cancel_pending has an infallible legacy trait signature. An exception in
     // that callback must still invalidate an otherwise successful final report.
@@ -134,7 +150,7 @@ impl ExternalComposition {
             "schema_version": 1,
             "role": role,
             "dp_size": dp_size,
-            "topology": topology.iter().map(topology_json).collect::<Vec<_>>(),
+            "topology": topology,
             "engine": engine.role(stage),
             "placement": placement,
             "selector_seed": self.determinism.selector_seed(),
@@ -291,62 +307,6 @@ impl ReplayEngineObservation for ExternalObservation {
             .map(|block| block.tokens_hash)
             .collect()
     }
-
-    fn kv_ingest_event_count(batch: &ObservationBatch) -> Option<usize> {
-        Some(
-            batch
-                .0
-                .iter()
-                .map(|observation| observation.events.len())
-                .sum(),
-        )
-    }
-
-    fn encode_kv_ingest(
-        batch: &ObservationBatch,
-        encoder: &mut KvIngestEventEncoder<'_>,
-    ) -> Result<()> {
-        for observation in &batch.0 {
-            for event in &observation.events {
-                let (tag, name) = match event.tier {
-                    KvEventTier::Device => (0, "device"),
-                    KvEventTier::HostPinned => (1, "host_pinned"),
-                };
-                encoder.begin_event(
-                    observation.worker_id.try_into()?,
-                    event.dp_rank,
-                    tag,
-                    name,
-                    event.event_id,
-                );
-                match &event.data {
-                    KvEventData::Stored(stored) => {
-                        encoder.begin_kind(0, "stored");
-                        encoder.put_optional_u64(stored.parent_hash);
-                        encoder.put_optional_u32(
-                            stored.start_position.map(u32::try_from).transpose()?,
-                        );
-                        encoder.put_len(stored.blocks.len(), "stored KV block count")?;
-                        encoder.add_blocks(stored.blocks.len(), "stored KV block count")?;
-                        for block in &stored.blocks {
-                            encoder.put_u64(block.block_hash);
-                            encoder.put_u64(block.tokens_hash);
-                            encoder.put_u8(0); // No multimodal block annotations in the engine protocol.
-                        }
-                    }
-                    KvEventData::Removed { block_hashes } => {
-                        encoder.begin_kind(1, "removed");
-                        encoder.put_len(block_hashes.len(), "removed KV block count")?;
-                        encoder.add_blocks(block_hashes.len(), "removed KV block count")?;
-                        for hash in block_hashes {
-                            encoder.put_u64(*hash);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Deserialize)]
@@ -358,41 +318,9 @@ struct Envelope {
 }
 
 #[derive(Deserialize)]
-struct WirePlacement {
-    request_id: Uuid,
-    scheduler_id: usize,
-    reported_overlap_tokens: usize,
-    cache_sample: Option<WireCacheSample>,
-    placement_replica_id: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct WireCacheSample {
-    overlap_blocks: u32,
-    best_available_overlap_blocks: u32,
-    isl_blocks: u32,
-}
-
-impl From<WirePlacement> for Placement {
-    fn from(value: WirePlacement) -> Self {
-        Self {
-            request_id: value.request_id,
-            scheduler_id: value.scheduler_id,
-            reported_overlap_tokens: value.reported_overlap_tokens,
-            cache_sample: value.cache_sample.map(|sample| PlacementCacheSample {
-                overlap_blocks: sample.overlap_blocks,
-                best_available_overlap_blocks: sample.best_available_overlap_blocks,
-                isl_blocks: sample.isl_blocks,
-            }),
-            placement_replica_id: value.placement_replica_id,
-        }
-    }
-}
-
-#[derive(Deserialize)]
 struct WireEffects {
-    placement: Option<WirePlacement>,
-    released: Vec<WirePlacement>,
+    placement: Option<Placement>,
+    released: Vec<Placement>,
 }
 
 struct ExternalPlacement {
@@ -466,8 +394,7 @@ impl ExternalPlacement {
     }
 
     fn releases(&mut self, command: Value) -> Result<Vec<Placement>> {
-        self.call::<Vec<WirePlacement>>(command)
-            .map(|placements| placements.into_iter().map(Into::into).collect())
+        self.call(command)
     }
 }
 
@@ -490,10 +417,8 @@ impl PlacementPolicy<ReplayRequestPayload> for ExternalPlacement {
         Ok(PlacementEffects {
             decision: effects
                 .placement
-                .map_or(PlacementDecision::Queued, |placement| {
-                    PlacementDecision::Immediate(placement.into())
-                }),
-            released: effects.released.into_iter().map(Into::into).collect(),
+                .map_or(PlacementDecision::Queued, PlacementDecision::Immediate),
+            released: effects.released,
         })
     }
 
@@ -537,30 +462,20 @@ impl PlacementPolicy<ReplayRequestPayload> for ExternalPlacement {
     }
 
     fn worker_ready(&mut self, worker: WorkerTopology, now_ms: f64) -> Result<Vec<Placement>> {
-        self.releases(
-            json!({"op": "worker_ready", "now_ms": now_ms, "worker": topology_json(&worker)}),
-        )
+        self.releases(json!({"op": "worker_ready", "now_ms": now_ms, "worker": worker}))
     }
 
     fn worker_draining(&mut self, worker: WorkerTopology, now_ms: f64) -> Result<Vec<Placement>> {
-        self.releases(
-            json!({"op": "worker_draining", "now_ms": now_ms, "worker": topology_json(&worker)}),
-        )
+        self.releases(json!({"op": "worker_draining", "now_ms": now_ms, "worker": worker}))
     }
 
     fn worker_removed(&mut self, worker: WorkerTopology, now_ms: f64) -> Result<Vec<Placement>> {
-        self.releases(
-            json!({"op": "worker_removed", "now_ms": now_ms, "worker": topology_json(&worker)}),
-        )
+        self.releases(json!({"op": "worker_removed", "now_ms": now_ms, "worker": worker}))
     }
 
     fn topology_settled(&mut self, now_ms: f64) -> Result<Vec<Placement>> {
         self.releases(json!({"op": "topology_settled", "now_ms": now_ms}))
     }
-}
-
-fn topology_json(worker: &WorkerTopology) -> Value {
-    json!({"worker_id": worker.worker_id, "scheduler_ids": worker.scheduler_ids})
 }
 
 fn stage_name(stage: WorkerStage) -> &'static str {
@@ -574,7 +489,7 @@ fn stage_name(stage: WorkerStage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{KvBlock, StoredBlocks};
+    use crate::engine::{KvBlock, KvEventTier, StoredBlocks};
     use crate::replay::{DirectRequest, ReplayTopology, WorkerPoolSpec};
     use pyo3::exceptions::PyValueError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -823,10 +738,6 @@ mod tests {
         let observation =
             ExternalObservation::observe_engine_events(WorkerStage::Prefill, 3, 2, events);
         assert_eq!(ExternalObservation::stored_hashes(&observation), vec![8]);
-        assert_eq!(
-            ExternalObservation::kv_ingest_event_count(&observation),
-            Some(2)
-        );
         policy.observe(observation, 4.5).unwrap();
         let evidence = snapshot(&mut policy);
         let observation = &evidence["calls"][1]["events"][0];

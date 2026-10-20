@@ -40,9 +40,11 @@ def dynamo_policy():
         if required:
             pytest.fail(f"Dynamo policy acceptance requires ai-dynamo-runtime with OfflineRouter: {error}")
         pytest.skip("optional Dynamo policy runtime is not installed")
-    if not hasattr(core, "OfflineRouter"):
+    if not hasattr(getattr(core, "OfflineRouter", None), "submit") or not hasattr(core, "SessionAffinity"):
         if required:
-            pytest.fail("installed ai-dynamo-runtime does not expose OfflineRouter; build the policy API revision")
+            pytest.fail(
+                "installed ai-dynamo-runtime lacks native scheduler/affinity bindings; build the policy API revision"
+            )
         pytest.skip("installed Dynamo runtime predates the standalone OfflineRouter API")
     if required:
         try:
@@ -426,3 +428,51 @@ def test_weka_agentx_cli_keeps_parent_and_child_lineage(tmp_path, topology, mode
     for root in (parent, independent):
         assert root["lineage"]["root_conversation_id"] == root["conversation_id"]
         assert "parent_conversation_id" not in root["lineage"]
+
+
+@pytest.mark.parametrize("dispatch", ["dispatch_committed", "dispatch_aborted"])
+def test_policy_releases_conversation_waiters_after_dispatch(dispatch, dynamo_policy):
+    from aisimulate.router import _DynamoPolicy
+
+    policy = _DynamoPolicy(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "role": "aggregated",
+                "dp_size": 1,
+                "topology": [{"worker_id": 0, "scheduler_ids": [0]}],
+                "engine": {"rank": {"block_size": 4, "num_gpu_blocks": 128, "max_num_batched_tokens": 32}},
+                "placement": {"config": {"affinity": {"mode": "session", "ttl_seconds": 1}}},
+                "selector_seed": 7,
+                "capture_decisions": True,
+            }
+        )
+    )
+
+    def call(op, **fields):
+        return json.loads(policy.call_json(json.dumps({"op": op, **fields})))
+
+    def place(request_id):
+        return call(
+            "place",
+            now_ms=0,
+            input_length=4,
+            session_id="conversation",
+            request={"uuid": request_id, "tokens": [1, 2, 3, 4], "max_output_tokens": 2},
+        )
+
+    # Authored tokens without precomputed hashes exercise native hashing too.
+    first = place("first")["result"]["placement"]
+    assert first is not None
+    assert place("second")["result"]["placement"] is None
+    call(dispatch, request_id="first", now_ms=0)
+    assert call("cancel_pending", request_id="unknown")["next_wakeup_ms"] == 0
+    released = call("advance_clock", now_ms=0)
+    assert [row["request_id"] for row in released["result"]] == ["second"]
+    assert released["pending_count"] == 0
+    evidence = call("snapshot")["evidence"]
+    assert evidence["decisions"][-1]["binding_reused"] == (dispatch == "dispatch_committed")
+    call("dispatch_committed", request_id="second", now_ms=0)
+    call("request_terminal", request_id="first", now_ms=0)
+    call("request_terminal", request_id="second", now_ms=0)
+    assert not policy.active and not policy.staged

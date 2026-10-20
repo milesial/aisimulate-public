@@ -28,9 +28,10 @@ copying a growing decision log on every callback. Policy errors fail simulation;
 they cannot silently select another policy. Evidence is returned by role in
 `external_policy` and may be presented by the Python adapter as `routing_policy`.
 
-Dynamo's standalone `OfflineRouter` implements the policy side without depending
-on AISimulate. The built-in `engine.router` adapter only translates configuration
-and transport fields. The `ai-dynamo` whole-run plugin and its AISimulate version
+The built-in `engine.router` adapter implements this transport in AISimulate and
+calls Dynamo's native `OfflineRouter`, `SessionAffinity`, and existing `RadixTree`
+Python interfaces. Dynamo does not interpret AISimulate requests, conversation
+lineage, lifecycle messages or reports; the adapter translates those host fields. The `ai-dynamo` whole-run plugin and its AISimulate version
 update are optional for this path. The AISimulate CLI and its acceptance suite
 exercise the complete AgentX simulation. See the
 [AgentX quickstart](../replay/agentic/quickstart.md).

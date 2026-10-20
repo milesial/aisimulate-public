@@ -7,6 +7,7 @@
 //! can later become a standalone crate without deployment-specific APIs.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::replay::ReplayTerminalStatus;
@@ -56,7 +57,7 @@ pub trait AdmissionSource {
     fn total_requests(&self) -> usize;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct PlacementCacheSample {
     /// Prefix blocks available on the selected worker.
     pub overlap_blocks: u32,
@@ -65,7 +66,7 @@ pub struct PlacementCacheSample {
     pub isl_blocks: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Placement {
     pub request_id: Uuid,
     pub scheduler_id: usize,
@@ -87,7 +88,7 @@ pub struct PlacementEffects {
     pub released: Vec<Placement>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerTopology {
     pub worker_id: usize,
     pub scheduler_ids: Vec<usize>,

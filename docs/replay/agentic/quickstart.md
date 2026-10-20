@@ -28,7 +28,7 @@ hardware performance accuracy.
 
 This development path requires [AISimulate #306](https://github.com/ai-dynamo/aisimulate/pull/306)
 and [Dynamo #16854](https://github.com/ai-dynamo/dynamo/pull/16854), which exposes
-the standalone `dynamo._core.OfflineRouter` API in the runtime wheel. It does not require the `ai-dynamo` runner package or
+the native scheduler and session-affinity Python interfaces in the runtime wheel. It does not require the `ai-dynamo` runner package or
 [Dynamo #15240](https://github.com/ai-dynamo/dynamo/pull/15240). The policy API
 must be provided in Dynamo first; AISimulate then consumes and accepts that API.
 Updating Dynamo's separate simulation integration to a newer AISimulate is an
@@ -36,7 +36,7 @@ optional downstream follow-up.
 
 Follow [AISimulate source installation](../../getting-started/installation.md#use-current-source)
 and Dynamo's source-build instructions at policy API revision
-[`2c4be58bdd6a2dc78c409bdfd67ad54d1b6fedf8`](https://github.com/ai-dynamo/dynamo/commit/2c4be58bdd6a2dc78c409bdfd67ad54d1b6fedf8). This guide
+[`b5a8eab3d62b26ed3bc5ff341574658c920aefb9`](https://github.com/ai-dynamo/dynamo/commit/b5a8eab3d62b26ed3bc5ff341574658c920aefb9). This guide
 does not claim that an existing released runtime exposes that API. Record both
 source revisions and wheel hashes. No Dynamo release backport is required.
 Install the builds into `/tmp/agentx-quickstart/venv` and check their interfaces:
@@ -45,16 +45,17 @@ Install the builds into `/tmp/agentx-quickstart/venv` and check their interfaces
 /tmp/agentx-quickstart/venv/bin/python - <<'PYTHON'
 from aisimulate import _runtime
 from aisimulate.config_adapter import resolve_config_adapters
-from dynamo._core import OfflineRouter
+from dynamo._core import OfflineRouter, SessionAffinity
 assert callable(_runtime.run_replay_with_policy_json)
-assert callable(OfflineRouter)
+assert callable(OfflineRouter.submit)
+assert callable(SessionAffinity.try_acquire)
 print(resolve_config_adapters(["engine.router"])["engine.router"].name)
 PYTHON
 ```
 
 Dynamo #15631 and #16490 provide virtual-time and admission APIs used by the
 standalone policy. Those implementations stay in Dynamo. AISimulate passes
-neutral lifecycle events to the policy; it does not fetch or compile a second
+translated requests and lifecycle calls to the native APIs; it does not fetch or compile a second
 Dynamo source tree. A missing policy API fails explicitly, without falling back
 to round-robin.
 
